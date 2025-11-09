@@ -184,7 +184,11 @@ def filter_files(
 
 
 def preprocess_gaze_data(
-    df: pd.DataFrame, remove_missing: bool = True, normalize: bool = False
+    df: pd.DataFrame,
+    remove_missing: bool = True,
+    normalize: bool = True,
+    infer_fixations: bool = False,
+    clip_outlier_speed_quantile: float = 0.999,
 ) -> pd.DataFrame:
     """
     Preprocess raw gaze data for feature extraction.
@@ -207,11 +211,70 @@ def preprocess_gaze_data(
         if removed > 0:
             print(f"Removed {removed} rows with missing gaze data")
 
-    # Normalize timestamps to start at 0 for each file/session
-    df_clean["timestamp_sec"] = df_clean["timestamp_ms"] / 1000.0
+    # Normalize timestamps to seconds
+    df_clean["timestamp_sec"] = df_clean["timestamp_ms"].astype(float) / 1000.0
 
-    # Calculate velocity (if needed for later feature extraction)
-    # This is a placeholder - your partner will do detailed feature extraction
+    # Optional normalization of gaze_x/y into [0,1]
+    if normalize:
+        def _norm(group: pd.DataFrame) -> pd.DataFrame:
+            gx = group["gaze_x"].astype(float)
+            gy = group["gaze_y"].astype(float)
+            # If already in [0,1], leave as-is
+            if (gx.between(0, 1).mean() > 0.98) and (gy.between(0, 1).mean() > 0.98):
+                group["gaze_x_norm"] = gx
+                group["gaze_y_norm"] = gy
+                return group
+            # Min-max per user-session
+            gx_min, gx_max = gx.min(), gx.max()
+            gy_min, gy_max = gy.min(), gy.max()
+            gx_rng = gx_max - gx_min if gx_max > gx_min else 1.0
+            gy_rng = gy_max - gy_min if gy_max > gy_min else 1.0
+            group["gaze_x_norm"] = ((gx - gx_min) / gx_rng).clip(0.0, 1.0)
+            group["gaze_y_norm"] = ((gy - gy_min) / gy_rng).clip(0.0, 1.0)
+            return group
+
+        if "user_id" in df_clean.columns and "session" in df_clean.columns:
+            df_clean = df_clean.groupby(["user_id", "session"], group_keys=False).apply(_norm)
+        elif "user_id" in df_clean.columns:
+            df_clean = df_clean.groupby(["user_id"], group_keys=False).apply(_norm)
+        else:
+            df_clean = _norm(df_clean)
+        # Replace original columns for downstream compatibility
+        df_clean["gaze_x"] = df_clean["gaze_x_norm"]
+        df_clean["gaze_y"] = df_clean["gaze_y_norm"]
+
+    # Compute per-user/session temporal deltas and kinematics
+    def _kin(group: pd.DataFrame) -> pd.DataFrame:
+        group = group.sort_values("timestamp_sec", kind="mergesort").copy()
+        dt = group["timestamp_sec"].diff().fillna(0.0)
+        # Replace zeros with median dt to avoid inf speeds
+        med_dt = dt[dt > 0].median() if (dt > 0).any() else 1.0 / 90.0
+        dt = dt.where(dt > 0, other=med_dt)
+        dx = group["gaze_x"].astype(float).diff().fillna(0.0)
+        dy = group["gaze_y"].astype(float).diff().fillna(0.0)
+        speed = np.sqrt(dx * dx + dy * dy) / dt
+        group["dt"] = dt
+        group["dx"] = dx
+        group["dy"] = dy
+        group["gaze_speed"] = speed
+        # Clip extreme speeds for robustness
+        if clip_outlier_speed_quantile:
+            q = np.nanquantile(group["gaze_speed"], clip_outlier_speed_quantile)
+            if np.isfinite(q) and q > 0:
+                group["gaze_speed"] = np.clip(group["gaze_speed"], 0, q)
+        return group
+
+    if "user_id" in df_clean.columns and "session" in df_clean.columns:
+        df_clean = df_clean.groupby(["user_id", "session"], group_keys=False).apply(_kin)
+    elif "user_id" in df_clean.columns:
+        df_clean = df_clean.groupby(["user_id"], group_keys=False).apply(_kin)
+    else:
+        df_clean = _kin(df_clean)
+
+    # Optional fixation inference from speed
+    if infer_fixations and "fixation_status" not in df_clean.columns:
+        thr = df_clean.groupby("user_id")["gaze_speed"].transform(lambda s: s.quantile(0.6)) if "user_id" in df_clean.columns else df_clean["gaze_speed"].quantile(0.6)
+        df_clean["fixation_status"] = (df_clean["gaze_speed"] < thr).astype(bool)
 
     return df_clean
 
