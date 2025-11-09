@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Data Files (GazebaseVR CSVs - too large for git)
+*.csv
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Test Scripts (temporary)
+test_*.py
+final_test_*.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Results/Output
+results/
+*.log
+plots/
+*.png
+*.jpg
+*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+
