@@ -17,9 +17,9 @@ ENV/
 *.pkl
 *.pickle
 
-# Test Scripts (temporary)
-test_*.py
-final_test_*.py
+# Test Scripts (temporary) - REMOVED to include main tests
+# test_*.py
+# final_test_*.py
 
 # IDE
 .vscode/
