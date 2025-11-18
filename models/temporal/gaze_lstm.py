@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 from typing import Tuple, Optional
 
 
@@ -134,162 +135,189 @@ class GazeLSTMClassifier:
         self.classes_ = None
         
     def _create_sequences(self, X, y):
-        """Create sequences from windowed features."""
+        """Create sequences from windowed features (no padding)."""
         sequences = []
         labels = []
-        
-        # Group by user
         unique_users = np.unique(y)
         for user in unique_users:
             user_mask = (y == user)
             user_X = X[user_mask]
-            
-            # Create sequences
-            for i in range(len(user_X) - self.seq_length + 1):
-                seq = user_X[i:i + self.seq_length]
+            n = len(user_X)
+            if n >= self.seq_length:
+                for i in range(n - self.seq_length + 1):
+                    seq = user_X[i:i + self.seq_length]
+                    sequences.append(seq)
+                    labels.append(user)
+        # Ensure a numeric, contiguous float32 array to avoid object dtype downstream
+        if len(sequences) == 0:
+            return np.empty((0, self.seq_length, X.shape[1]), dtype=np.float32), np.array(labels)
+        return np.asarray(sequences, dtype=np.float32), np.asarray(labels)
+
+    def _create_sequences_with_padding(self, X, y):
+        sequences = []
+        labels = []
+        unique_users = np.unique(y)
+        for user in unique_users:
+            user_mask = (y == user)
+            user_X = X[user_mask]
+            n = len(user_X)
+            if n >= self.seq_length:
+                for i in range(n - self.seq_length + 1):
+                    seq = user_X[i:i + self.seq_length]
+                    sequences.append(seq)
+                    labels.append(user)
+            elif n > 0:
+                pad_needed = self.seq_length - n
+                pad_block = np.repeat(user_X[-1][None, :], pad_needed, axis=0)
+                seq = np.concatenate([user_X, pad_block], axis=0)
                 sequences.append(seq)
                 labels.append(user)
-        
-        return np.array(sequences), np.array(labels)
+        if len(sequences) == 0:
+            return np.empty((0, self.seq_length, X.shape[1]), dtype=np.float32), np.array(labels)
+        return np.asarray(sequences, dtype=np.float32), np.asarray(labels)
     
-    def train(self, X, y):
-        """Train the LSTM model."""
-        print(f"Initialized LSTM classifier (seq_length={self.seq_length}, hidden={self.hidden_size}, layers={self.num_layers})")
-        
-        # Handle NaN
-        X = np.nan_to_num(X, nan=0.0)
-        
-        # Scale features
-        self.scaler_mean = np.mean(X, axis=0)
-        self.scaler_std = np.std(X, axis=0)
-        self.scaler_std[self.scaler_std == 0] = 1
-        X_scaled = (X - self.scaler_mean) / self.scaler_std
-        
-        # Create sequences
-        X_seq, y_seq = self._create_sequences(X_scaled, y)
-        
+    def _sanitize(self, X: np.ndarray) -> np.ndarray:
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        try:
+            p1 = np.nanpercentile(X, 1, axis=0)
+            p99 = np.nanpercentile(X, 99, axis=0)
+            X = np.clip(X, p1, p99)
+        except Exception:
+            pass
+        X[~np.isfinite(X)] = 0.0
+        return X
+
+    def _scale(self, X: np.ndarray) -> np.ndarray:
+        self.scaler_mean = X.mean(axis=0)
+        var = ((X - self.scaler_mean) ** 2).mean(axis=0)
+        self.scaler_std = np.sqrt(var + 1e-8)
+        scaled = (X - self.scaler_mean) / self.scaler_std
+        scaled[~np.isfinite(scaled)] = 0.0
+        return scaled.astype(np.float32, copy=False)
+
+    def _apply_scale(self, X: np.ndarray) -> np.ndarray:
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        scaled = (X - self.scaler_mean) / self.scaler_std
+        scaled[~np.isfinite(scaled)] = 0.0
+        return scaled.astype(np.float32, copy=False)
+
+    def train(self, X, y, continue_training: bool = False):
+        phase = "fine-tune" if continue_training and self.model is not None else "initial"
+        print(f"Initialized LSTM classifier ({phase}, seq_length={self.seq_length}, hidden={self.hidden_size}, layers={self.num_layers})")
+        if not continue_training or self.model is None:
+            X_clean = self._sanitize(X)
+            X_scaled = self._scale(X_clean)
+        else:
+            X_scaled = self._apply_scale(self._sanitize(X))
+        if continue_training:
+            X_seq, y_seq = self._create_sequences_with_padding(X_scaled, y)
+        else:
+            X_seq, y_seq = self._create_sequences(X_scaled, y)
         if len(X_seq) == 0:
-            raise ValueError(f"Not enough data to create sequences (need at least {self.seq_length} samples)")
-        
+            if continue_training:
+                print(f"⚠️ Fine-tune skipped: no sequences (seq_length={self.seq_length}).")
+                return
+            raise ValueError(f"Not enough data to create sequences (need >= {self.seq_length})")
         print(f"Training LSTM on {len(X_seq)} sequences...")
-        
-        # Get classes
-        self.classes_ = np.unique(y_seq)
+        if self.classes_ is None or not continue_training:
+            self.classes_ = np.unique(y_seq)
         num_classes = len(self.classes_)
-        
-        # Map labels to indices
         label_to_idx = {label: idx for idx, label in enumerate(self.classes_)}
         y_idx = np.array([label_to_idx[label] for label in y_seq])
-        
-        # Create model
         input_features = X_seq.shape[2]
-        self.model = GazeLSTM(
-            input_features, 
-            num_classes, 
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers
-        )
+        if self.model is None:
+            self.model = GazeLSTM(input_features, num_classes, hidden_size=self.hidden_size, num_layers=self.num_layers)
         self.model.to(self.device)
-        
-        # Training setup
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        
-        # Convert to tensors
-        X_tensor = torch.FloatTensor(X_seq).to(self.device)
-        y_tensor = torch.LongTensor(y_idx).to(self.device)
-        
-        # Training loop
+        # Enforce float32 dtype for stable tensor conversion
+        X_seq = X_seq.astype(np.float32, copy=False)
+        y_idx = y_idx.astype(np.int64, copy=False)
+        dataset = TensorDataset(torch.from_numpy(X_seq), torch.from_numpy(y_idx))
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         self.model.train()
+        final_correct = 0
+        final_total = 0
         for epoch in range(self.epochs):
-            optimizer.zero_grad()
-            outputs = self.model(X_tensor)
-            loss = criterion(outputs, y_tensor)
-            loss.backward()
-            optimizer.step()
-            
-            if (epoch + 1) % 10 == 0 or epoch == 0:
-                # Calculate accuracy
-                _, predicted = torch.max(outputs, 1)
-                accuracy = (predicted == y_tensor).float().mean().item()
-                print(f"  Epoch {epoch+1}/{self.epochs}: Loss={loss.item():.4f}, Acc={accuracy:.4f}")
-        
-        # Final accuracy
-        self.model.eval()
-        with torch.no_grad():
-            outputs = self.model(X_tensor)
-            _, predicted = torch.max(outputs, 1)
-            accuracy = (predicted == y_tensor).float().mean().item()
-        
-        print(f"✅ Training complete! Training accuracy: {accuracy:.4f}")
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
+            for xb, yb in loader:
+                xb = xb.to(self.device)
+                yb = yb.to(self.device)
+                optimizer.zero_grad()
+                out = self.model(xb)
+                loss = criterion(out, yb)
+                if torch.isnan(loss):
+                    print("  ⚠️ NaN loss encountered; skipping batch")
+                    continue
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                optimizer.step()
+                epoch_loss += loss.item() * xb.size(0)
+                _, pred = out.max(1)
+                correct += (pred == yb).sum().item()
+                total += xb.size(0)
+            # accumulate for final accuracy over all epochs (last epoch sufficient but keep running tally)
+            final_correct = correct
+            final_total = total
+            if total == 0:
+                print("  ⚠️ No valid batches this epoch")
+                continue
+            if (epoch + 1) % max(1, self.epochs // 5) == 0 or epoch == 0:
+                print(f"  Epoch {epoch+1}/{self.epochs}: Loss={epoch_loss/total:.4f}, Acc={correct/total:.4f}")
+        train_acc = final_correct / final_total if final_total > 0 else 0.0
+        print(f"✅ Training complete! Training accuracy: {train_acc:.4f}")
         
     def predict(self, X):
-        """Predict class labels."""
         if self.model is None:
             raise ValueError("Model not trained yet")
-        
-        # Handle NaN and scale
-        X = np.nan_to_num(X, nan=0.0)
-        X_scaled = (X - self.scaler_mean) / self.scaler_std
-        
-        # Create sequences
+        X_scaled = self._apply_scale(self._sanitize(X))
         X_seq, _ = self._create_sequences(X_scaled, np.zeros(len(X)))
-        
         if len(X_seq) == 0:
-            # Not enough data, return first class
             return np.array([self.classes_[0]] * len(X))
-        
-        # Predict
         self.model.eval()
         with torch.no_grad():
-            X_tensor = torch.FloatTensor(X_seq).to(self.device)
+            X_tensor = torch.from_numpy(np.asarray(X_seq, dtype=np.float32)).to(self.device)
             outputs = self.model(X_tensor)
-            _, predicted_idx = torch.max(outputs, 1)
-            predicted_idx = predicted_idx.cpu().numpy()
-        
-        # Map back to original labels
-        predictions = self.classes_[predicted_idx]
-        
-        # Expand predictions to match input length
-        full_predictions = np.full(len(X), predictions[0])
+            _, predicted_idx = outputs.max(1)
+        predictions = self.classes_[predicted_idx.cpu().numpy()]
+        votes = [[] for _ in range(len(X))]
         for i in range(len(predictions)):
-            start_idx = i
-            end_idx = min(i + self.seq_length, len(X))
-            full_predictions[start_idx:end_idx] = predictions[i]
-        
-        return full_predictions
+            for w in range(i, i + self.seq_length):
+                if w < len(X):
+                    votes[w].append(predictions[i])
+        final = []
+        for v in votes:
+            if not v:
+                final.append(self.classes_[0])
+            else:
+                vals, counts = np.unique(v, return_counts=True)
+                final.append(vals[np.argmax(counts)])
+        return np.array(final)
     
     def predict_proba(self, X):
-        """Predict class probabilities."""
         if self.model is None:
             raise ValueError("Model not trained yet")
-        
-        # Handle NaN and scale
-        X = np.nan_to_num(X, nan=0.0)
-        X_scaled = (X - self.scaler_mean) / self.scaler_std
-        
-        # Create sequences
+        X_scaled = self._apply_scale(self._sanitize(X))
         X_seq, _ = self._create_sequences(X_scaled, np.zeros(len(X)))
-        
         if len(X_seq) == 0:
-            # Not enough data, return uniform probabilities
-            proba = np.ones((len(X), len(self.classes_))) / len(self.classes_)
-            return proba
-        
-        # Predict
+            return np.ones((len(X), len(self.classes_))) / len(self.classes_)
         self.model.eval()
         with torch.no_grad():
-            X_tensor = torch.FloatTensor(X_seq).to(self.device)
+            X_tensor = torch.from_numpy(np.asarray(X_seq, dtype=np.float32)).to(self.device)
             outputs = self.model(X_tensor)
-            probas = torch.softmax(outputs, dim=1).cpu().numpy()
-        
-        # Expand probabilities to match input length
-        full_probas = np.zeros((len(X), len(self.classes_)))
-        for i in range(len(X)):
-            seq_idx = min(i, len(probas) - 1)
-            full_probas[i] = probas[seq_idx]
-        
-        return full_probas
+            probas_seq = torch.softmax(outputs, dim=1).cpu().numpy()
+        agg = np.zeros((len(X), len(self.classes_)))
+        counts = np.zeros(len(X))
+        for i in range(len(probas_seq)):
+            for w in range(i, i + self.seq_length):
+                if w < len(X):
+                    agg[w] += probas_seq[i]
+                    counts[w] += 1
+        counts[counts == 0] = 1
+        agg /= counts[:, None]
+        return agg
     
     def save(self, path: str):
         """Save model to disk."""

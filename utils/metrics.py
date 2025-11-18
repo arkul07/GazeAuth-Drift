@@ -329,3 +329,239 @@ def plot_performance_over_time(metrics_by_period: Dict[int, Dict[str, float]],
         print(f"Performance plot saved to {save_path}")
     else:
         plt.show()
+
+
+# ===================== Biometric Score Utilities =====================
+def build_user_score_vectors(y_true: np.ndarray, proba: np.ndarray, classes: List) -> Dict[str, Dict[str, np.ndarray]]:
+    """Construct genuine and impostor score arrays per user.
+
+    Args:
+        y_true: Array of true user labels (same length as proba rows)
+        proba: (n_windows, n_users) probability estimates (higher = more likely user)
+        classes: List/array of user identifiers aligned to proba columns
+
+    Returns:
+        dict mapping user -> { 'genuine': scores_when_true, 'impostor': scores_when_not_true }
+    """
+    result: Dict[str, Dict[str, np.ndarray]] = {}
+    for idx, user in enumerate(classes):
+        user_scores = proba[:, idx]
+        genuine_mask = (y_true == user)
+        result[str(user)] = {
+            'genuine': user_scores[genuine_mask],
+            'impostor': user_scores[~genuine_mask]
+        }
+    return result
+
+
+def compute_eer_from_scores(genuine_scores: np.ndarray, impostor_scores: np.ndarray) -> Tuple[float, float]:
+    """Compute EER given genuine + impostor score distributions.
+
+    Returns:
+        (eer, threshold)
+    """
+    if len(genuine_scores) == 0 or len(impostor_scores) == 0:
+        return 0.0, 0.0
+    scores = np.concatenate([genuine_scores, impostor_scores])
+    labels = np.concatenate([np.ones(len(genuine_scores)), np.zeros(len(impostor_scores))])
+    # filter out NaN/Inf scores to avoid sklearn errors
+    finite_mask = np.isfinite(scores)
+    scores = scores[finite_mask]
+    labels = labels[finite_mask]
+    if scores.size == 0:
+        return 0.0, 0.0
+    # guard if all scores identical -> roc_curve may return nan thresholds
+    try:
+        fpr, tpr, thresholds = roc_curve(labels, scores, pos_label=1)
+    except ValueError:
+        return 0.5, 0.0
+    frr = 1 - tpr
+    diff = np.abs(fpr - frr)
+    i = np.argmin(diff)
+    eer = (fpr[i] + frr[i]) / 2
+    thr = thresholds[i] if np.isfinite(thresholds[i]) else 0.0
+    return float(eer), float(thr)
+
+
+def aggregate_global_eer(per_user_scores: Dict[str, Dict[str, np.ndarray]]) -> Tuple[float, float]:
+    """Aggregate global EER treating all users' genuine/impostor scores pooled.
+
+    Args:
+        per_user_scores: Output of build_user_score_vectors
+    Returns:
+        (global_eer, threshold)
+    """
+    all_genuine = []
+    all_impostor = []
+    for user, d in per_user_scores.items():
+        all_genuine.append(d['genuine'])
+        all_impostor.append(d['impostor'])
+    if not all_genuine or not all_impostor:
+        return 0.0, 0.0
+    # filter out any empty arrays before concatenate
+    genuines = [arr for arr in all_genuine if arr is not None and arr.size > 0]
+    impostors = [arr for arr in all_impostor if arr is not None and arr.size > 0]
+    if not genuines or not impostors:
+        return 0.0, 0.0
+    g = np.concatenate(genuines)
+    imp = np.concatenate(impostors)
+    return compute_eer_from_scores(g, imp)
+
+
+def far_frr_at_threshold(genuine_scores: np.ndarray, impostor_scores: np.ndarray, threshold: float) -> Tuple[float, float]:
+    """Compute FAR (FMR) and FRR for a given threshold.
+    FAR = fraction of impostor scores >= threshold
+    FRR = fraction of genuine scores < threshold
+    """
+    if len(genuine_scores) == 0 or len(impostor_scores) == 0:
+        return 0.0, 0.0
+    # filter non-finite
+    g = genuine_scores[np.isfinite(genuine_scores)]
+    imp = impostor_scores[np.isfinite(impostor_scores)]
+    if len(g) == 0 or len(imp) == 0:
+        return 0.0, 0.0
+    far = np.mean(imp >= threshold)
+    frr = np.mean(g < threshold)
+    return far, frr
+
+
+# ===================== Sequence-level Fusion Utilities =====================
+def aggregate_window_proba_to_sequences(
+    proba: np.ndarray,
+    window_to_seq: List,
+    reducer: str = "mean"
+) -> Tuple[np.ndarray, List]:
+    """Aggregate window-level class probabilities to sequence-level scores.
+
+    Args:
+        proba: (n_windows, n_classes) window-level probabilities or scores
+        window_to_seq: list/array of sequence identifiers per window (length n_windows)
+        reducer: 'mean' | 'median' | 'max' | 'softmax' (logit-mean)
+
+    Returns:
+        seq_proba: (n_sequences, n_classes) aggregated scores per sequence
+        seq_ids: list of unique sequence identifiers in aggregation order
+    """
+    window_to_seq = np.array(window_to_seq)
+    seq_ids = list(pd.unique(window_to_seq))
+    seq_to_idx = {sid: i for i, sid in enumerate(seq_ids)}
+    n_classes = proba.shape[1]
+    # collect list per sequence
+    buckets: List[List[np.ndarray]] = [[] for _ in seq_ids]
+    for w_idx, sid in enumerate(window_to_seq):
+        buckets[seq_to_idx[sid]].append(proba[w_idx])
+
+    seq_proba = np.zeros((len(seq_ids), n_classes), dtype=float)
+    for i, arrs in enumerate(buckets):
+        if not arrs:
+            continue
+        stack = np.stack(arrs, axis=0)
+        # If stack is entirely non-finite, leave as zeros and continue
+        if not np.isfinite(stack).any():
+            continue
+        if reducer == "mean":
+            seq_proba[i] = np.nanmean(stack, axis=0)
+        elif reducer == "median":
+            seq_proba[i] = np.nanmedian(stack, axis=0)
+        elif reducer == "max":
+            seq_proba[i] = np.nanmax(stack, axis=0)
+        elif reducer == "softmax":
+            # average logits: log-mean-exp for numerical stability
+            eps = 1e-12
+            stack_clip = np.clip(stack, eps, 1.0)
+            logits = np.log(stack_clip)
+            m = np.max(logits, axis=0, keepdims=True)
+            logmeanexp = m + np.log(np.mean(np.exp(logits - m), axis=0, keepdims=True))
+            seq_proba[i] = np.exp(logmeanexp).ravel()
+            # renormalize to sum=1 in case of numerical drift
+            s = seq_proba[i].sum()
+            if s > 0:
+                seq_proba[i] /= s
+        else:
+            seq_proba[i] = np.nanmean(stack, axis=0)
+        # Replace non-finite or degenerate rows with a uniform distribution
+        if not np.isfinite(seq_proba[i]).all() or seq_proba[i].sum() == 0:
+            seq_proba[i] = np.ones(n_classes, dtype=float) / n_classes
+    return seq_proba, seq_ids
+
+
+def sequence_level_identification_accuracy(
+    y_true_windows: np.ndarray,
+    proba_windows: np.ndarray,
+    window_to_seq: List,
+    classes: List,
+    reducer: str = "mean"
+) -> float:
+    """Compute sequence-level (trial-level) identification accuracy by fusing
+    window probabilities within each sequence and taking argmax.
+
+    Args:
+        y_true_windows: (n_windows,) true class per window
+        proba_windows: (n_windows, n_classes) probabilities per window
+        window_to_seq: sequence id per window (same length)
+        classes: class labels aligned with proba columns
+        reducer: aggregation method ('mean'|'median'|'max'|'softmax')
+
+    Returns:
+        float accuracy over sequences
+    """
+    seq_proba, seq_ids = aggregate_window_proba_to_sequences(proba_windows, window_to_seq, reducer)
+    # determine true label per sequence by majority vote of window labels
+    window_to_seq_arr = np.array(window_to_seq)
+    correct = 0
+    for i, sid in enumerate(seq_ids):
+        mask = window_to_seq_arr == sid
+        true_labels = y_true_windows[mask]
+        # majority vote
+        if len(true_labels) == 0:
+            continue
+        vals, counts = np.unique(true_labels, return_counts=True)
+        seq_true = vals[np.argmax(counts)]
+        pred_idx = int(np.argmax(seq_proba[i]))
+        pred_label = classes[pred_idx]
+        if pred_label == seq_true:
+            correct += 1
+    return correct / len(seq_ids) if len(seq_ids) > 0 else 0.0
+
+
+def sequence_level_scores_for_verification(
+    y_true_windows: np.ndarray,
+    proba_windows: np.ndarray,
+    window_to_seq: List,
+    classes: List,
+    reducer: str = "mean"
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Build per-user genuine/impostor score vectors at sequence level.
+
+    For each sequence, compute the target-user score from the aggregated
+    probabilities. Then split aggregated scores into genuine vs impostor
+    by comparing the sequence's majority-vote label.
+    """
+    seq_proba, seq_ids = aggregate_window_proba_to_sequences(proba_windows, window_to_seq, reducer)
+    window_to_seq_arr = np.array(window_to_seq)
+    # determine true label per sequence by majority vote
+    seq_true_labels: List = []
+    for sid in seq_ids:
+        mask = window_to_seq_arr == sid
+        true_labels = y_true_windows[mask]
+        vals, counts = np.unique(true_labels, return_counts=True)
+        seq_true_labels.append(vals[np.argmax(counts)])
+
+    per_user: Dict[str, Dict[str, List[float]]] = {str(u): {"genuine": [], "impostor": []} for u in classes}
+    for i, seq_true in enumerate(seq_true_labels):
+        for col_idx, user in enumerate(classes):
+            score = float(seq_proba[i, col_idx])
+            if user == seq_true:
+                per_user[str(user)]["genuine"].append(score)
+            else:
+                per_user[str(user)]["impostor"].append(score)
+
+    # convert lists to arrays
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+    for user, d in per_user.items():
+        out[user] = {
+            "genuine": np.array(d["genuine"], dtype=float),
+            "impostor": np.array(d["impostor"], dtype=float)
+        }
+    return out
+

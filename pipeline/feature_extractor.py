@@ -81,9 +81,12 @@ def detect_fixations(df: pd.DataFrame, velocity_threshold: float = 100.0) -> Lis
     dx = df['gaze_x'].diff()
     dy = df['gaze_y'].diff()
     dt = df['timestamp_sec'].diff()
-    
+    # guard against zero/non-positive time deltas
+    dt = dt.mask(dt <= 0)
+    # compute velocity safely
     velocity = np.sqrt(dx**2 + dy**2) / dt
-    velocity = velocity.fillna(0)
+    # replace non-finite with zeros to avoid propagating NaNs/Infs
+    velocity = velocity.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     
     # Identify fixation points (velocity < threshold)
     is_fixation = velocity < velocity_threshold
@@ -112,20 +115,20 @@ def detect_fixations(df: pd.DataFrame, velocity_threshold: float = 100.0) -> Lis
                     'duration': fix_data['timestamp_sec'].iloc[-1] - fix_data['timestamp_sec'].iloc[0],
                     'center_x': fix_data['gaze_x'].mean(),
                     'center_y': fix_data['gaze_y'].mean(),
-                    'dispersion': np.sqrt(fix_data['gaze_x'].std()**2 + fix_data['gaze_y'].std()**2)
+                    'dispersion': np.sqrt((fix_data['gaze_x'].std() or 0.0)**2 + (fix_data['gaze_y'].std() or 0.0)**2)
                 })
     
     # Handle case where fixation extends to end of window
     if in_fixation and start_idx is not None:
         fix_data = df.iloc[start_idx:]
-        if len(fix_data) >= 3:
+    if len(fix_data) >= 3:
             fixations.append({
                 'start_idx': start_idx,
                 'end_idx': len(df),
                 'duration': fix_data['timestamp_sec'].iloc[-1] - fix_data['timestamp_sec'].iloc[0],
                 'center_x': fix_data['gaze_x'].mean(),
                 'center_y': fix_data['gaze_y'].mean(),
-                'dispersion': np.sqrt(fix_data['gaze_x'].std()**2 + fix_data['gaze_y'].std()**2)
+                'dispersion': np.sqrt((fix_data['gaze_x'].std() or 0.0)**2 + (fix_data['gaze_y'].std() or 0.0)**2)
             })
     
     return fixations
@@ -279,17 +282,18 @@ def calculate_scanpath_features(df: pd.DataFrame) -> Dict[str, float]:
     dx = df['gaze_x'].diff()
     dy = df['gaze_y'].diff()
     distances = np.sqrt(dx**2 + dy**2)
-    scanpath_length = distances.sum()
+    distances = distances.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    scanpath_length = float(distances.sum())
     
     # Scanpath coverage (area explored)
-    x_range = df['gaze_x'].max() - df['gaze_x'].min()
-    y_range = df['gaze_y'].max() - df['gaze_y'].min()
+    x_range = (df['gaze_x'].max() - df['gaze_x'].min()) if len(df) > 0 else 0.0
+    y_range = (df['gaze_y'].max() - df['gaze_y'].min()) if len(df) > 0 else 0.0
     coverage = x_range * y_range
     
     # Scanpath entropy (spatial distribution)
     # Divide screen into grid and calculate entropy
-    x_bins = np.histogram(df['gaze_x'], bins=10)[0]
-    y_bins = np.histogram(df['gaze_y'], bins=10)[0]
+    x_bins = np.histogram(df['gaze_x'].values if len(df) > 0 else np.array([0.0]), bins=10)[0]
+    y_bins = np.histogram(df['gaze_y'].values if len(df) > 0 else np.array([0.0]), bins=10)[0]
     spatial_entropy = entropy(x_bins + 1) + entropy(y_bins + 1)
     
     # Fixation-based scanpath features
@@ -309,9 +313,9 @@ def calculate_scanpath_features(df: pd.DataFrame) -> Dict[str, float]:
         fixation_distance_std = 0
     
     return {
-        'scanpath_length': scanpath_length,
-        'scanpath_coverage': coverage,
-        'scanpath_entropy': spatial_entropy,
+    'scanpath_length': float(scanpath_length),
+    'scanpath_coverage': float(coverage),
+    'scanpath_entropy': float(spatial_entropy),
         'fixation_distance_mean': fixation_distance_mean,
         'fixation_distance_std': fixation_distance_std,
     }
@@ -331,9 +335,11 @@ def calculate_velocity_features(df: pd.DataFrame) -> Dict[str, float]:
     dx = df['gaze_x'].diff()
     dy = df['gaze_y'].diff()
     dt = df['timestamp_sec'].diff()
-    
+    # guard against zero/non-positive time deltas
+    dt = dt.mask(dt <= 0)
+    # compute velocity; replace non-finite
     velocity = np.sqrt(dx**2 + dy**2) / dt
-    velocity = velocity.dropna()
+    velocity = velocity.replace([np.inf, -np.inf], np.nan).dropna()
     
     if len(velocity) == 0:
         return {
@@ -346,18 +352,19 @@ def calculate_velocity_features(df: pd.DataFrame) -> Dict[str, float]:
         }
     
     # Acceleration
-    acceleration = velocity.diff() / dt.iloc[1:]
-    acceleration = acceleration.dropna()
+    # align acceleration with valid velocity indices; use simple diff over valid velocity with unit step
+    acceleration = velocity.diff()
+    acceleration = acceleration.replace([np.inf, -np.inf], np.nan).dropna()
     
     return {
-        'velocity_mean': velocity.mean(),
-        'velocity_std': velocity.std(),
-        'velocity_max': velocity.max(),
-        'velocity_median': velocity.median(),
-        'velocity_q25': velocity.quantile(0.25),
-        'velocity_q75': velocity.quantile(0.75),
-        'acceleration_mean': acceleration.mean() if len(acceleration) > 0 else 0,
-        'acceleration_std': acceleration.std() if len(acceleration) > 0 else 0,
+    'velocity_mean': float(velocity.mean()),
+    'velocity_std': float(velocity.std()),
+    'velocity_max': float(velocity.max()),
+    'velocity_median': float(velocity.median()),
+    'velocity_q25': float(velocity.quantile(0.25)),
+    'velocity_q75': float(velocity.quantile(0.75)),
+    'acceleration_mean': float(acceleration.mean()) if len(acceleration) > 0 else 0.0,
+    'acceleration_std': float(acceleration.std()) if len(acceleration) > 0 else 0.0,
     }
 
 
@@ -373,16 +380,16 @@ def calculate_statistical_features(df: pd.DataFrame) -> Dict[str, float]:
     """
     features = {
         # Gaze position statistics
-        'gaze_x_mean': df['gaze_x'].mean(),
-        'gaze_x_std': df['gaze_x'].std(),
-        'gaze_x_min': df['gaze_x'].min(),
-        'gaze_x_max': df['gaze_x'].max(),
-        'gaze_x_range': df['gaze_x'].max() - df['gaze_x'].min(),
-        'gaze_y_mean': df['gaze_y'].mean(),
-        'gaze_y_std': df['gaze_y'].std(),
-        'gaze_y_min': df['gaze_y'].min(),
-        'gaze_y_max': df['gaze_y'].max(),
-        'gaze_y_range': df['gaze_y'].max() - df['gaze_y'].min(),
+        'gaze_x_mean': float(df['gaze_x'].mean()) if len(df) > 0 else 0.0,
+        'gaze_x_std': float(df['gaze_x'].std()) if len(df) > 1 else 0.0,
+        'gaze_x_min': float(df['gaze_x'].min()) if len(df) > 0 else 0.0,
+        'gaze_x_max': float(df['gaze_x'].max()) if len(df) > 0 else 0.0,
+        'gaze_x_range': float((df['gaze_x'].max() - df['gaze_x'].min())) if len(df) > 0 else 0.0,
+        'gaze_y_mean': float(df['gaze_y'].mean()) if len(df) > 0 else 0.0,
+        'gaze_y_std': float(df['gaze_y'].std()) if len(df) > 1 else 0.0,
+        'gaze_y_min': float(df['gaze_y'].min()) if len(df) > 0 else 0.0,
+        'gaze_y_max': float(df['gaze_y'].max()) if len(df) > 0 else 0.0,
+        'gaze_y_range': float((df['gaze_y'].max() - df['gaze_y'].min())) if len(df) > 0 else 0.0,
     }
     
     # Binocular disparity (if available)
@@ -390,10 +397,10 @@ def calculate_statistical_features(df: pd.DataFrame) -> Dict[str, float]:
         disparity_x = (df['left_eye_x'] - df['right_eye_x']).abs()
         disparity_y = (df['left_eye_y'] - df['right_eye_y']).abs()
         
-        features['binocular_disparity_x_mean'] = disparity_x.mean()
-        features['binocular_disparity_x_std'] = disparity_x.std()
-        features['binocular_disparity_y_mean'] = disparity_y.mean()
-        features['binocular_disparity_y_std'] = disparity_y.std()
+    features['binocular_disparity_x_mean'] = float(disparity_x.mean()) if len(disparity_x) > 0 else 0.0
+    features['binocular_disparity_x_std'] = float(disparity_x.std()) if len(disparity_x) > 1 else 0.0
+    features['binocular_disparity_y_mean'] = float(disparity_y.mean()) if len(disparity_y) > 0 else 0.0
+    features['binocular_disparity_y_std'] = float(disparity_y.std()) if len(disparity_y) > 1 else 0.0
     
     return features
 
@@ -417,6 +424,11 @@ def extract_window_features(window_df: pd.DataFrame) -> Dict[str, float]:
         features['window_id'] = window_df['window_id'].iloc[0]
     if 'time_period' in window_df.columns:
         features['time_period'] = window_df['time_period'].iloc[0]
+    # Carry round/task for sequence grouping
+    if 'round' in window_df.columns:
+        features['round'] = window_df['round'].iloc[0]
+    if 'task' in window_df.columns:
+        features['task'] = window_df['task'].iloc[0]
     
     # Extract all feature types
     features.update(calculate_fixation_features(window_df))

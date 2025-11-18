@@ -225,21 +225,37 @@ def train_test_split_by_user(features_df: pd.DataFrame,
 
 def prepare_features(features_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Prepare feature matrix and labels from features DataFrame.
-    
+    Prepare numeric feature matrix and labels from features DataFrame.
+
+    - Excludes metadata columns (ids, session, etc.)
+    - Drops any non-numeric columns (e.g., 'seq_id', string fields)
+    - Returns float64 numpy array for compatibility with downstream scalers/models
+
     Args:
         features_df: DataFrame with extracted features
-        
+
     Returns:
         X (features), y (labels)
     """
-    # Identify feature columns (exclude metadata)
-    metadata_cols = ['user_id', 'session', 'window_id', 'time_period', 'round', 'task']
-    feature_cols = [col for col in features_df.columns if col not in metadata_cols]
-    
-    X = features_df[feature_cols].values
-    y = features_df['user_id'].values
-    
+    # Identify feature columns (exclude metadata and known non-feature fields)
+    metadata_cols = [
+        'user_id', 'session', 'window_id', 'time_period', 'round', 'task',
+        'seq_id', 'file_path'
+    ]
+    candidate_cols = [col for col in features_df.columns if col not in metadata_cols]
+
+    # Keep only numeric columns among candidates
+    numeric_cols = [
+        col for col in candidate_cols
+        if pd.api.types.is_numeric_dtype(features_df[col])
+    ]
+
+    if len(numeric_cols) == 0:
+        raise ValueError("No numeric feature columns found after filtering metadata and non-numeric fields.")
+
+    X = features_df[numeric_cols].to_numpy(dtype=float)
+    y = features_df['user_id'].to_numpy()
+
     print(f"Prepared {X.shape[0]} samples with {X.shape[1]} features")
-    
+
     return X, y
