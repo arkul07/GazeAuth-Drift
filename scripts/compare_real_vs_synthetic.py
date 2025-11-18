@@ -32,7 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data.gazebase_loader import load_gazebase_data, preprocess_gaze_data, parse_filename  # type: ignore
-from data.simulated_drift import create_longitudinal_dataset  # type: ignore
+from data.simulated_drift import create_longitudinal_dataset, create_longitudinal_dataset_calibrated  # type: ignore
 from pipeline.feature_extractor import extract_gaze_features  # type: ignore
 from models.baselines import prepare_features  # type: ignore
 from utils.metrics import (
@@ -192,6 +192,7 @@ def main():
     parser.add_argument("--drift-type", type=str, default="linear", choices=["linear", "exponential", "periodic", "none"], help="Synthetic drift type")
     parser.add_argument("--drift-mag", type=float, default=0.12, help="Synthetic drift magnitude (0-1)")
     parser.add_argument("--num-periods", type=int, default=2, help="Number of synthetic periods (>=2 to emulate S2)")
+    parser.add_argument("--calibration-json", type=str, default="", help="Path to calibration JSON (if provided, overrides drift-type/mag)")
     parser.add_argument("--max-subjects", type=int, default=10, help="Cap number of subjects for quick runs")
     args = parser.parse_args()
 
@@ -209,7 +210,13 @@ def main():
     df_s2 = preprocess_gaze_data(load_gazebase_data(str(raw_dir), subjects=subjects, sessions=[2], tasks=tasks))
 
     # Synthetic S2' from S1
-    df_s2_syn = create_longitudinal_dataset(df_s1, num_periods=args.num_periods, drift_type=args.drift_type, drift_magnitude=args.drift_mag)
+    if args.calibration_json:
+        import json as _json
+        with open(args.calibration_json, 'r') as f:
+            calib = _json.load(f)
+        df_s2_syn = create_longitudinal_dataset_calibrated(df_s1, calib, groupby='task', num_periods=args.num_periods)
+    else:
+        df_s2_syn = create_longitudinal_dataset(df_s1, num_periods=args.num_periods, drift_type=args.drift_type, drift_magnitude=args.drift_mag)
     # approximate: take last period as synthetic S2'
     df_s2_syn = df_s2_syn[df_s2_syn['time_period'] == df_s2_syn['time_period'].max()].copy()
     # Keep metadata consistent: session=2 label for synthetic

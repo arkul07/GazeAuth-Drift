@@ -325,3 +325,176 @@ def compare_drift_types(
         results[drift_type] = periods
 
     return results
+
+
+# ========================= Calibrated Drift (New) ========================= #
+
+def _safe_std(s: pd.Series, eps: float = 1e-8) -> float:
+    try:
+        v = float(np.nanstd(s.values))
+    except Exception:
+        v = 0.0
+    return max(v, eps)
+
+
+def estimate_drift_from_sessions(
+    df_s1: pd.DataFrame,
+    df_s2: pd.DataFrame,
+    groupby: str = "task",
+) -> Dict[str, Dict[str, float]]:
+    """
+    Estimate per-group drift parameters (shift/scale/noise) between S1 and S2
+    in raw gaze space. Returns a dict mapping group key -> params.
+
+    groupby: 'task' or 'user_task' (user_id+task)
+    Params per group:
+      - shift_x, shift_y
+      - scale_x, scale_y
+      - noise_x, noise_y (residual std not explained by scaling)
+      - optional per-eye variants if columns exist: left_eye/right_eye
+    """
+    if groupby not in ("task", "user_task"):
+        raise ValueError("groupby must be 'task' or 'user_task'")
+
+    def key_fn(row):
+        if groupby == "task":
+            return str(row.get("task", "UNK"))
+        return f"{int(row.get('user_id', -1))}:{str(row.get('task', 'UNK'))}"
+
+    df1 = df_s1.copy(); df1["__key__"] = df1.apply(key_fn, axis=1)
+    df2 = df_s2.copy(); df2["__key__"] = df2.apply(key_fn, axis=1)
+
+    keys = sorted(set(df1["__key__"].unique()).intersection(set(df2["__key__"].unique())))
+    calib: Dict[str, Dict[str, float]] = {}
+
+    for k in keys:
+        g1 = df1[df1["__key__"] == k]
+        g2 = df2[df2["__key__"] == k]
+        params: Dict[str, float] = {}
+
+        # Core gaze
+        if {"gaze_x", "gaze_y"}.issubset(g1.columns) and {"gaze_x", "gaze_y"}.issubset(g2.columns):
+            mean1x, mean1y = float(np.nanmean(g1["gaze_x"])), float(np.nanmean(g1["gaze_y"]))
+            mean2x, mean2y = float(np.nanmean(g2["gaze_x"])), float(np.nanmean(g2["gaze_y"]))
+            std1x, std1y = _safe_std(g1["gaze_x"]), _safe_std(g1["gaze_y"])
+            std2x, std2y = _safe_std(g2["gaze_x"]), _safe_std(g2["gaze_y"])
+
+            params["shift_x"] = mean2x - mean1x
+            params["shift_y"] = mean2y - mean1y
+            params["scale_x"] = max(0.1, min(5.0, std2x / std1x))
+            params["scale_y"] = max(0.1, min(5.0, std2y / std1y))
+
+            # Residual noise beyond pure scaling of S1
+            noise_x = max(0.0, std2x - params["scale_x"] * std1x)
+            noise_y = max(0.0, std2y - params["scale_y"] * std1y)
+            params["noise_x"] = noise_x
+            params["noise_y"] = noise_y
+
+        # Per-eye (optional)
+        for eye in ("left_eye", "right_eye"):
+            xcol, ycol = f"{eye}_x", f"{eye}_y"
+            if xcol in g1.columns and xcol in g2.columns and ycol in g1.columns and ycol in g2.columns:
+                mean1x, mean1y = float(np.nanmean(g1[xcol])), float(np.nanmean(g1[ycol]))
+                mean2x, mean2y = float(np.nanmean(g2[xcol])), float(np.nanmean(g2[ycol]))
+                std1x, std1y = _safe_std(g1[xcol]), _safe_std(g1[ycol])
+                std2x, std2y = _safe_std(g2[xcol]), _safe_std(g2[ycol])
+                params[f"{eye}_shift_x"] = mean2x - mean1x
+                params[f"{eye}_shift_y"] = mean2y - mean1y
+                scx = max(0.1, min(5.0, std2x / std1x))
+                scy = max(0.1, min(5.0, std2y / std1y))
+                params[f"{eye}_scale_x"] = scx
+                params[f"{eye}_scale_y"] = scy
+                params[f"{eye}_noise_x"] = max(0.0, std2x - scx * std1x)
+                params[f"{eye}_noise_y"] = max(0.0, std2y - scy * std1y)
+
+        calib[k] = params
+
+    return calib
+
+
+def _apply_calibrated_params(df: pd.DataFrame, params: Dict[str, float], alpha: float = 1.0, jitter: float = 0.05) -> pd.DataFrame:
+    """
+    Apply a fraction (alpha) of the calibrated drift to a copy of df.
+    jitter adds small random variation to avoid deterministic patterns.
+    """
+    out = df.copy()
+    rng = np.random.default_rng()
+
+    # Gaze
+    if "gaze_x" in out.columns and "gaze_y" in out.columns:
+        shift_x = params.get("shift_x", 0.0) * alpha
+        shift_y = params.get("shift_y", 0.0) * alpha
+        scale_x = 1.0 + (params.get("scale_x", 1.0) - 1.0) * alpha
+        scale_y = 1.0 + (params.get("scale_y", 1.0) - 1.0) * alpha
+        noise_x = params.get("noise_x", 0.0) * alpha
+        noise_y = params.get("noise_y", 0.0) * alpha
+
+        mx = float(np.nanmean(out["gaze_x"]))
+        my = float(np.nanmean(out["gaze_y"]))
+        out["gaze_x"] = mx + (out["gaze_x"] - mx) * scale_x + shift_x + rng.normal(0, max(1e-8, noise_x), len(out))
+        out["gaze_y"] = my + (out["gaze_y"] - my) * scale_y + shift_y + rng.normal(0, max(1e-8, noise_y), len(out))
+
+        # mild random jitter
+        out["gaze_x"] += rng.normal(0, jitter * max(1e-3, float(np.nanstd(out["gaze_x"]))), len(out))
+        out["gaze_y"] += rng.normal(0, jitter * max(1e-3, float(np.nanstd(out["gaze_y"]))), len(out))
+
+    for eye in ("left_eye", "right_eye"):
+        xcol, ycol = f"{eye}_x", f"{eye}_y"
+        if xcol in out.columns and ycol in out.columns:
+            shift_x = params.get(f"{eye}_shift_x", 0.0) * alpha
+            shift_y = params.get(f"{eye}_shift_y", 0.0) * alpha
+            scale_x = 1.0 + (params.get(f"{eye}_scale_x", 1.0) - 1.0) * alpha
+            scale_y = 1.0 + (params.get(f"{eye}_scale_y", 1.0) - 1.0) * alpha
+            noise_x = params.get(f"{eye}_noise_x", 0.0) * alpha
+            noise_y = params.get(f"{eye}_noise_y", 0.0) * alpha
+            mx = float(np.nanmean(out[xcol])); my = float(np.nanmean(out[ycol]))
+            out[xcol] = mx + (out[xcol] - mx) * scale_x + shift_x + rng.normal(0, max(1e-8, noise_x), len(out))
+            out[ycol] = my + (out[ycol] - my) * scale_y + shift_y + rng.normal(0, max(1e-8, noise_y), len(out))
+    return out
+
+
+def create_longitudinal_dataset_calibrated(
+    base_data: pd.DataFrame,
+    calibration: Dict[str, Dict[str, float]],
+    groupby: str = "task",
+    num_periods: int = 2,
+    alpha_schedule: str = "linear",
+) -> pd.DataFrame:
+    """
+    Generate longitudinal data by applying estimated per-group drift gradually.
+
+    - groupby: 'task' or 'user_task' must match keys in calibration
+    - alpha_schedule: how to scale drift across periods; currently 'linear'
+    """
+    print("\nGenerating calibrated longitudinal dataset:")
+    print(f"  Groupby: {groupby}")
+    print(f"  Periods: {num_periods}")
+
+    def key_from_row(r: pd.Series) -> str:
+        if groupby == "task":
+            return str(r.get("task", "UNK"))
+        return f"{int(r.get('user_id', -1))}:{str(r.get('task', 'UNK'))}"
+
+    # Period 0 is base
+    periods = []
+    for p in range(num_periods):
+        if num_periods <= 1:
+            alpha = 0.0
+        else:
+            alpha = p / (num_periods - 1) if alpha_schedule == "linear" else p / (num_periods - 1)
+        dfp = base_data.copy()
+        # apply per-group params
+        keys = dfp.apply(key_from_row, axis=1)
+        dfp["__key__"] = keys
+        if p > 0:
+            out_chunks = []
+            for k, chunk in dfp.groupby("__key__"):
+                params = calibration.get(k) or calibration.get("DEFAULT", {})
+                out_chunks.append(_apply_calibrated_params(chunk, params, alpha=alpha))
+            dfp = pd.concat(out_chunks, ignore_index=True)
+        dfp["time_period"] = p
+        periods.append(dfp)
+
+    out = pd.concat(periods, ignore_index=True)
+    print(f"\n✓ Generated {len(out):,} samples across {num_periods} periods (calibrated)")
+    return out
