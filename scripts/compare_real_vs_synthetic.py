@@ -193,6 +193,7 @@ def main():
     parser.add_argument("--drift-mag", type=float, default=0.12, help="Synthetic drift magnitude (0-1)")
     parser.add_argument("--num-periods", type=int, default=2, help="Number of synthetic periods (>=2 to emulate S2)")
     parser.add_argument("--calibration-json", type=str, default="", help="Path to calibration JSON (if provided, overrides drift-type/mag)")
+    parser.add_argument("--calibration-groupby", type=str, default="task", choices=["task", "user_task"], help="Grouping used in calibration JSON and to generate synthetic")
     parser.add_argument("--max-subjects", type=int, default=10, help="Cap number of subjects for quick runs")
     args = parser.parse_args()
 
@@ -214,7 +215,7 @@ def main():
         import json as _json
         with open(args.calibration_json, 'r') as f:
             calib = _json.load(f)
-        df_s2_syn = create_longitudinal_dataset_calibrated(df_s1, calib, groupby='task', num_periods=args.num_periods)
+        df_s2_syn = create_longitudinal_dataset_calibrated(df_s1, calib, groupby=args.calibration_groupby, num_periods=args.num_periods)
     else:
         df_s2_syn = create_longitudinal_dataset(df_s1, num_periods=args.num_periods, drift_type=args.drift_type, drift_magnitude=args.drift_mag)
     # approximate: take last period as synthetic S2'
@@ -271,6 +272,10 @@ def main():
                 'drift_magnitude': args.drift_mag,
                 'num_periods': args.num_periods,
                 'use_last_period_as_S2': True,
+                'calibration': {
+                    'json': args.calibration_json if args.calibration_json else None,
+                    'groupby': args.calibration_groupby if args.calibration_json else None,
+                }
             }
         }
     }
