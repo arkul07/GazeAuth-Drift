@@ -50,3 +50,12 @@ Thumbs.db
 *.ckpt
 
 
+
+# Experiment output logs
+*_output.txt
+*_results.txt
+*.csv
+
+# Keep results but not raw logs
+!advanced_synthetic_results.csv
+!real_vs_synthetic_results.csv
