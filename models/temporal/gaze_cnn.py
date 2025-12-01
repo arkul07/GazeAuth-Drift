@@ -16,14 +16,14 @@ import math
 class GazeCNN(nn.Module):
     """
     1D CNN for gaze authentication using temporal feature sequences.
-    
+
     Architecture:
     - Input: (batch, seq_len, features)
     - Conv1D layers to extract temporal patterns
     - Global pooling
     - Fully connected layers for classification
     """
-    
+
     def __init__(self, input_features: int, num_classes: int, seq_length: int = 10):
         """
         Args:
@@ -32,11 +32,11 @@ class GazeCNN(nn.Module):
             seq_length: Length of input sequences
         """
         super(GazeCNN, self).__init__()
-        
+
         self.input_features = input_features
         self.num_classes = num_classes
         self.seq_length = seq_length
-        
+
         # 1D Convolutional layers
         # Input: (batch, features, seq_len)
         self.conv1 = nn.Conv1d(input_features, 64, kernel_size=3, padding=1)
@@ -44,77 +44,82 @@ class GazeCNN(nn.Module):
         self.relu1 = nn.ReLU()
         self.pool1 = nn.MaxPool1d(kernel_size=2)
         self.dropout1 = nn.Dropout(0.3)
-        
+
         self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm1d(128)
         self.relu2 = nn.ReLU()
         self.pool2 = nn.MaxPool1d(kernel_size=2)
         self.dropout2 = nn.Dropout(0.3)
-        
+
         self.conv3 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm1d(256)
         self.relu3 = nn.ReLU()
-        
+
         # Global Average Pooling
         self.global_pool = nn.AdaptiveAvgPool1d(1)
-        
+
         # Fully connected layers
         self.fc1 = nn.Linear(256, 128)
         self.fc_relu = nn.ReLU()
         self.fc_dropout = nn.Dropout(0.5)
         self.fc2 = nn.Linear(128, num_classes)
-        
+
     def forward(self, x):
         """
         Forward pass.
-        
+
         Args:
             x: (batch_size, seq_length, input_features)
-        
+
         Returns:
             logits: (batch_size, num_classes)
         """
         # Transpose to (batch, features, seq_len) for Conv1d
         x = x.transpose(1, 2)
-        
+
         # Conv block 1
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu1(x)
         x = self.pool1(x)
         x = self.dropout1(x)
-        
+
         # Conv block 2
         x = self.conv2(x)
         x = self.bn2(x)
         x = self.relu2(x)
         x = self.pool2(x)
         x = self.dropout2(x)
-        
+
         # Conv block 3
         x = self.conv3(x)
         x = self.bn3(x)
         x = self.relu3(x)
-        
+
         # Global pooling
         x = self.global_pool(x)
         x = x.squeeze(-1)  # (batch, 256)
-        
+
         # Fully connected
         x = self.fc1(x)
         x = self.fc_relu(x)
         x = self.fc_dropout(x)
         x = self.fc2(x)
-        
+
         return x
 
 
 class GazeCNNClassifier:
     """Wrapper for GazeCNN with sklearn-like interface."""
-    
-    def __init__(self, seq_length: int = 10, epochs: int = 50, 
-                 batch_size: int = 32, learning_rate: float = 0.001,
-                 device: str = 'cpu'):
+
+    def __init__(
+        self,
+        seq_length: int = 10,
+        epochs: int = 50,
+        batch_size: int = 32,
+        learning_rate: float = 0.001,
+        device: str = "cpu",
+    ):
         """
         Args:
             seq_length: Number of consecutive windows per sequence
@@ -132,7 +137,7 @@ class GazeCNNClassifier:
         self.scaler_mean = None
         self.scaler_std = None
         self.classes_ = None
-        
+
     def _create_sequences(self, X, y):
         """Create sequences from windowed features.
 
@@ -144,19 +149,21 @@ class GazeCNNClassifier:
         labels = []
         unique_users = np.unique(y)
         for user in unique_users:
-            user_mask = (y == user)
+            user_mask = y == user
             user_X = X[user_mask]
             n = len(user_X)
             if n >= self.seq_length:
                 for i in range(n - self.seq_length + 1):
-                    seq = user_X[i:i + self.seq_length]
+                    seq = user_X[i : i + self.seq_length]
                     sequences.append(seq)
                     labels.append(user)
             else:
                 # padding path only used in fine-tune; decided by caller removing sequences if not allowed
                 pass
         if len(sequences) == 0:
-            return np.empty((0, self.seq_length, X.shape[1]), dtype=np.float32), np.array(labels)
+            return np.empty(
+                (0, self.seq_length, X.shape[1]), dtype=np.float32
+            ), np.array(labels)
         seq_arr = np.asarray(sequences, dtype=np.float32)
         lab_arr = np.asarray(labels)
         return seq_arr, lab_arr
@@ -166,12 +173,12 @@ class GazeCNNClassifier:
         labels = []
         unique_users = np.unique(y)
         for user in unique_users:
-            user_mask = (y == user)
+            user_mask = y == user
             user_X = X[user_mask]
             n = len(user_X)
             if n >= self.seq_length:
                 for i in range(n - self.seq_length + 1):
-                    seq = user_X[i:i + self.seq_length]
+                    seq = user_X[i : i + self.seq_length]
                     sequences.append(seq)
                     labels.append(user)
             elif n > 0:
@@ -181,14 +188,18 @@ class GazeCNNClassifier:
                 sequences.append(seq)
                 labels.append(user)
         if len(sequences) == 0:
-            return np.empty((0, self.seq_length, X.shape[1]), dtype=np.float32), np.array(labels)
+            return np.empty(
+                (0, self.seq_length, X.shape[1]), dtype=np.float32
+            ), np.array(labels)
         seq_arr = np.asarray(sequences, dtype=np.float32)
         lab_arr = np.asarray(labels)
         return seq_arr, lab_arr
-    
+
     def _sanitize(self, X: np.ndarray) -> np.ndarray:
         """Replace NaN/inf and clip extreme values via percentiles."""
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0).astype(
+            np.float32, copy=False
+        )
         # Clip each feature to 1st-99th percentile using nanpercentile for robustness
         try:
             p1 = np.nanpercentile(X, 1, axis=0)
@@ -216,8 +227,12 @@ class GazeCNNClassifier:
 
     def train(self, X, y, continue_training: bool = False):
         """Train the CNN model. If continue_training=True, reuse existing model weights for fine-tuning."""
-        phase = "fine-tune" if continue_training and self.model is not None else "initial"
-        print(f"Initialized CNN classifier ({phase}, seq_length={self.seq_length}, epochs={self.epochs})")
+        phase = (
+            "fine-tune" if continue_training and self.model is not None else "initial"
+        )
+        print(
+            f"Initialized CNN classifier ({phase}, seq_length={self.seq_length}, epochs={self.epochs})"
+        )
 
         # Scale or apply existing scaler
         if not continue_training or self.model is None:
@@ -233,10 +248,14 @@ class GazeCNNClassifier:
             X_seq, y_seq = self._create_sequences(X_scaled, y)
         if len(X_seq) == 0:
             if continue_training:
-                print(f"⚠️ Fine-tune skipped: no sequences could be formed (seq_length={self.seq_length}).")
+                print(
+                    f"⚠️ Fine-tune skipped: no sequences could be formed (seq_length={self.seq_length})."
+                )
                 return
             else:
-                raise ValueError(f"Not enough data to create sequences (need >= {self.seq_length})")
+                raise ValueError(
+                    f"Not enough data to create sequences (need >= {self.seq_length})"
+                )
         print(f"Training CNN on {len(X_seq)} sequences...")
 
         # Class management
@@ -259,7 +278,9 @@ class GazeCNNClassifier:
         self.model.to(self.device)
 
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        # Use lower learning rate for fine-tuning (0.0001 = 10x lower, prevents catastrophic forgetting)
+        lr = 0.0001 if continue_training else self.learning_rate
+        optimizer = optim.Adam(self.model.parameters(), lr=lr)
 
         dataset = TensorDataset(torch.FloatTensor(X_seq), torch.LongTensor(y_idx))
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
@@ -290,7 +311,9 @@ class GazeCNNClassifier:
                 print("  ⚠️ No valid batches this epoch")
                 continue
             if (epoch + 1) % max(1, self.epochs // 5) == 0 or epoch == 0:
-                print(f"  Epoch {epoch+1}/{self.epochs}: Loss={epoch_loss/total:.4f}, Acc={correct/total:.4f}")
+                print(
+                    f"  Epoch {epoch+1}/{self.epochs}: Loss={epoch_loss/total:.4f}, Acc={correct/total:.4f}"
+                )
 
         # Final training accuracy
         self.model.eval()
@@ -306,7 +329,7 @@ class GazeCNNClassifier:
                 total += yb.size(0)
             train_acc = correct / max(1, total)
         print(f"✅ Training complete! Training accuracy: {train_acc:.4f}")
-        
+
     def predict(self, X):
         if self.model is None:
             raise ValueError("Model not trained yet")
@@ -334,7 +357,7 @@ class GazeCNNClassifier:
                 vals, counts = np.unique(v, return_counts=True)
                 final.append(vals[np.argmax(counts)])
         return np.array(final)
-    
+
     def predict_proba(self, X):
         if self.model is None:
             raise ValueError("Model not trained yet")
@@ -358,40 +381,38 @@ class GazeCNNClassifier:
         counts[counts == 0] = 1
         agg /= counts[:, None]
         return agg
-    
+
     def save(self, path: str):
         """Save model to disk."""
         if self.model is None:
             raise ValueError("Model not trained yet")
-        
+
         state = {
-            'model_state': self.model.state_dict(),
-            'scaler_mean': self.scaler_mean,
-            'scaler_std': self.scaler_std,
-            'classes_': self.classes_,
-            'seq_length': self.seq_length,
-            'input_features': self.model.input_features,
-            'num_classes': self.model.num_classes
+            "model_state": self.model.state_dict(),
+            "scaler_mean": self.scaler_mean,
+            "scaler_std": self.scaler_std,
+            "classes_": self.classes_,
+            "seq_length": self.seq_length,
+            "input_features": self.model.input_features,
+            "num_classes": self.model.num_classes,
         }
         torch.save(state, path)
-    
+
     @classmethod
-    def load(cls, path: str, device: str = 'cpu'):
+    def load(cls, path: str, device: str = "cpu"):
         """Load model from disk."""
         state = torch.load(path, map_location=device)
-        
-        classifier = cls(seq_length=state['seq_length'], device=device)
-        classifier.scaler_mean = state['scaler_mean']
-        classifier.scaler_std = state['scaler_std']
-        classifier.classes_ = state['classes_']
-        
+
+        classifier = cls(seq_length=state["seq_length"], device=device)
+        classifier.scaler_mean = state["scaler_mean"]
+        classifier.scaler_std = state["scaler_std"]
+        classifier.classes_ = state["classes_"]
+
         classifier.model = GazeCNN(
-            state['input_features'],
-            state['num_classes'],
-            state['seq_length']
+            state["input_features"], state["num_classes"], state["seq_length"]
         )
-        classifier.model.load_state_dict(state['model_state'])
+        classifier.model.load_state_dict(state["model_state"])
         classifier.model.to(device)
         classifier.model.eval()
-        
+
         return classifier
