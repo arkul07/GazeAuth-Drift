@@ -26,6 +26,9 @@ SEQ_LENGTH = 5
 EPOCHS = 15  # Faster for comparison
 MIXED_REPLAY_RATIO = 0.5
 
+# Reproducibility
+np.random.seed(42)
+
 print("=" * 70)
 print("REAL vs SYNTHETIC DRIFT COMPARISON")
 print("=" * 70)
@@ -192,6 +195,12 @@ analyzer = DriftAnalyzer()
 profile = analyzer.analyze(X_s1, y_s1, X_s2, y_s2)
 analyzer.print_summary()
 
+# Build S1->S2 delta covariance for correlated noise
+n_cov = min(len(X_s1), len(X_s2))
+_delta = X_s2[:n_cov] - X_s1[:n_cov]
+_delta = _delta - np.nanmean(_delta, axis=0)
+_delta_cov = np.cov(_delta.T) if len(_delta) > 1 else np.cov((X_s1 - np.nanmean(X_s1, axis=0)).T)
+
 # =============================================================================
 # STEP 3: Generate Synthetic Drift Variants
 # =============================================================================
@@ -199,11 +208,157 @@ print("\n" + "=" * 70)
 print("STEP 3: Generate Synthetic Drift Variants")
 print("=" * 70)
 
-drift_variants = create_drift_variants(X_s1, y_s1, profile)
+drift_variants = create_drift_variants(X_s1, y_s1, profile, s1_s2_delta_cov=_delta_cov)
 print(f"Created {len(drift_variants)} synthetic drift variants:")
 for name in drift_variants:
     X_var, y_var = drift_variants[name]
     print(f"  - {name}: {len(X_var)} samples")
+    try:
+        mad_vs_s1 = float(np.nanmean(np.abs(X_var - X_s1[:len(X_var)])))
+        mad_vs_s2 = float(np.nanmean(np.abs(X_var - X_s2[:len(X_var)])))
+        print(f"    · mean|X_syn-X_s1|={mad_vs_s1:.4e}, mean|X_syn-X_s2|={mad_vs_s2:.4e}")
+    except Exception:
+        pass
+
+# Add tuned calibrated variant using temporal decay and correlated noise
+delta = (X_s2[:min(len(X_s2), len(X_s1))] - X_s1[:min(len(X_s2), len(X_s1))])
+delta = delta - np.nanmean(delta, axis=0)
+delta_cov = np.cov(delta.T) if len(delta) > 1 else np.eye(X_s1.shape[1])
+cal_gen = CalibratedSyntheticDrift(profile)
+X_cal_tuned, y_cal_tuned = cal_gen.generate_synthetic_session2(
+    X_s1, y_s1,
+    strength=0.9,
+    calibration_scale=0.7,
+    temporal_decay="early_strong_poly",
+    period_index=2,
+    total_periods=3,
+    correlated_noise=True,
+    s1_s2_delta_cov=delta_cov,
+)
+drift_variants['calibrated_tuned'] = (X_cal_tuned, y_cal_tuned)
+
+# Add a sequence-friendly calibrated variant (gentler for CNN/LSTM)
+try:
+    delta = (X_s2[:min(len(X_s2), len(X_s1))] - X_s1[:min(len(X_s2), len(X_s1))])
+    delta = delta - np.nanmean(delta, axis=0)
+    delta_cov = np.cov(delta.T) if len(delta) > 1 else np.eye(X_s1.shape[1])
+    cal_gen_seq = CalibratedSyntheticDrift(profile)
+    X_cal_seq, y_cal_seq = cal_gen_seq.generate_synthetic_session2(
+        X_s1, y_s1,
+        strength=0.8,
+        calibration_scale=0.5,
+        temporal_decay="linear",
+        period_index=1,
+        total_periods=3,
+        correlated_noise=True,
+        noise_scale_factor=0.5,
+        mean_shift_only=True,
+        s1_s2_delta_cov=delta_cov,
+    )
+    drift_variants['calibrated_seq_friendly'] = (X_cal_seq, y_cal_seq)
+    print(f"  - calibrated_seq_friendly: {len(X_cal_seq)} samples")
+    try:
+        mad_vs_s1 = float(np.nanmean(np.abs(X_cal_seq - X_s1[:len(X_cal_seq)])))
+        mad_vs_s2 = float(np.nanmean(np.abs(X_cal_seq - X_s2[:len(X_cal_seq)])))
+        print(f"    · mean|X_syn-X_s1|={mad_vs_s1:.4e}, mean|X_syn-X_s2|={mad_vs_s2:.4e}")
+    except Exception:
+        pass
+except Exception as e:
+    print(f"Failed to create calibrated_seq_friendly: {e}")
+
+# Add magnitude-matched calibrated variant to align average |S2-S1| drift
+try:
+    n = min(len(X_s1), len(X_s2))
+    target_mag = float(np.nanmean(np.abs(X_s2[:n] - X_s1[:n])))
+    cal_gen_mm = CalibratedSyntheticDrift(profile)
+    # Initial pass
+    X_tmp, _ = cal_gen_mm.generate_synthetic_session2(
+        X_s1, y_s1,
+        strength=0.9,
+        calibration_scale=1.0,
+        temporal_decay="early_strong_poly",
+        period_index=2,
+        total_periods=3,
+        correlated_noise=True,
+        noise_scale_factor=0.5,
+        mean_shift_only=False,
+        s1_s2_delta_cov=delta_cov,
+    )
+    curr_mag = float(np.nanmean(np.abs(X_tmp[:n] - X_s1[:n]))) + 1e-8
+    scale = np.clip(target_mag / curr_mag, 0.5, 5.0)
+    X_cal_mm, y_cal_mm = cal_gen_mm.generate_synthetic_session2(
+        X_s1, y_s1,
+        strength=0.9,
+        calibration_scale=scale,
+        temporal_decay="early_strong_poly",
+        period_index=2,
+        total_periods=3,
+        correlated_noise=True,
+        noise_scale_factor=0.5,
+        mean_shift_only=False,
+        s1_s2_delta_cov=delta_cov,
+    )
+    drift_variants['calibrated_magmatch'] = (X_cal_mm, y_cal_mm)
+    print(f"  - calibrated_magmatch: {len(X_cal_mm)} samples (scale={scale:.3f})")
+except Exception as e:
+    print(f"Failed to create calibrated_magmatch: {e}")
+
+# Add two extra seq-friendly variants with different strengths for CNN/LSTM calibration
+try:
+    delta = (X_s2[:min(len(X_s2), len(X_s1))] - X_s1[:min(len(X_s2), len(X_s1))])
+    delta = delta - np.nanmean(delta, axis=0)
+    delta_cov = np.cov(delta.T) if len(delta) > 1 else np.eye(X_s1.shape[1])
+    cal_gen_seq2 = CalibratedSyntheticDrift(profile)
+    X_cal_seq2, y_cal_seq2 = cal_gen_seq2.generate_synthetic_session2(
+        X_s1, y_s1,
+        strength=0.6,
+        calibration_scale=0.45,
+        temporal_decay="linear",
+        period_index=1,
+        total_periods=2,
+        correlated_noise=True,
+        noise_scale_factor=0.4,
+        mean_shift_only=True,
+        s1_s2_delta_cov=delta_cov,
+    )
+    drift_variants['calibrated_seq_friendly_v2'] = (X_cal_seq2, y_cal_seq2)
+    print(f"  - calibrated_seq_friendly_v2: {len(X_cal_seq2)} samples")
+    try:
+        mad_vs_s1 = float(np.nanmean(np.abs(X_cal_seq2 - X_s1[:len(X_cal_seq2)])))
+        mad_vs_s2 = float(np.nanmean(np.abs(X_cal_seq2 - X_s2[:len(X_cal_seq2)])))
+        print(f"    · mean|X_syn-X_s1|={mad_vs_s1:.4e}, mean|X_syn-X_s2|={mad_vs_s2:.4e}")
+    except Exception:
+        pass
+except Exception as e:
+    print(f"Failed to create calibrated_seq_friendly_v2: {e}")
+
+try:
+    delta = (X_s2[:min(len(X_s2), len(X_s1))] - X_s1[:min(len(X_s2), len(X_s1))])
+    delta = delta - np.nanmean(delta, axis=0)
+    delta_cov = np.cov(delta.T) if len(delta) > 1 else np.eye(X_s1.shape[1])
+    cal_gen_seq3 = CalibratedSyntheticDrift(profile)
+    X_cal_seq3, y_cal_seq3 = cal_gen_seq3.generate_synthetic_session2(
+        X_s1, y_s1,
+        strength=0.7,
+        calibration_scale=0.55,
+        temporal_decay="linear",
+        period_index=1,
+        total_periods=3,
+        correlated_noise=True,
+        noise_scale_factor=0.5,
+        mean_shift_only=True,
+        s1_s2_delta_cov=delta_cov,
+    )
+    drift_variants['calibrated_seq_friendly_v3'] = (X_cal_seq3, y_cal_seq3)
+    print(f"  - calibrated_seq_friendly_v3: {len(X_cal_seq3)} samples")
+    try:
+        mad_vs_s1 = float(np.nanmean(np.abs(X_cal_seq3 - X_s1[:len(X_cal_seq3)])))
+        mad_vs_s2 = float(np.nanmean(np.abs(X_cal_seq3 - X_s2[:len(X_cal_seq3)])))
+        print(f"    · mean|X_syn-X_s1|={mad_vs_s1:.4e}, mean|X_syn-X_s2|={mad_vs_s2:.4e}")
+    except Exception:
+        pass
+except Exception as e:
+    print(f"Failed to create calibrated_seq_friendly_v3: {e}")
 
 # =============================================================================
 # STEP 4: Run Comparison Experiments
@@ -263,7 +418,20 @@ print("=" * 70)
 
 # Prepare data for plotting
 models = ["KNN", "SVM", "CNN", "LSTM"]
-drift_types = ["REAL", "calibrated", "light", "heavy", "gaussian_only", "mean_shift_only"]
+drift_types = [
+    "REAL",
+    # Show magmatch first among synthetic variants for emphasis in plots
+    "calibrated_magmatch",
+    "calibrated",
+    "calibrated_tuned",
+    "calibrated_seq_friendly",
+    "calibrated_seq_friendly_v2",
+    "calibrated_seq_friendly_v3",
+    "light",
+    "heavy",
+    "gaussian_only",
+    "mean_shift_only",
+]
 
 fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
@@ -364,6 +532,22 @@ best_variant = min(drift_types[1:], key=lambda v: np.mean([
     for m in models
 ]))
 print(f"  → {best_variant}")
+
+# Difficulty metric: how far synthetic is from S1 vs how far S2 is from S1
+try:
+    n_cmp = min(len(X_s1), len(X_s2))
+    real_mag = float(np.nanmean(np.abs(X_s2[:n_cmp] - X_s1[:n_cmp]))) + 1e-8
+    print("\n🧪 DIFFICULTY METRIC (relative to real |S2-S1|):")
+    print("-" * 50)
+    for variant in drift_types[1:]:
+        X_syn, _ = (drift_variants.get(variant) if variant != 'REAL' else (X_s2, y_s2)) or (None, None)
+        if X_syn is None:
+            continue
+        syn_mag = float(np.nanmean(np.abs(X_syn[:n_cmp] - X_s1[:n_cmp])))
+        rel = syn_mag / real_mag
+        print(f"  {variant:20s}: {rel:6.3f}× of real")
+except Exception as _e:
+    pass
 
 print("\n📊 DETAILED COMPARISON (Real vs Best Synthetic):")
 print("-" * 50)
