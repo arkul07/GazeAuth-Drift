@@ -17,6 +17,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Dict, Tuple
+import argparse
+import re
+import glob
 
 # =============================================================================
 # CONFIGURATION
@@ -54,7 +57,51 @@ except ImportError:
     print("PyTorch not available")
 
 DATA_PATH = Path(__file__).parent / "data" / "raw"
-subjects = list(range(1002, 1022))  # 20 subjects
+
+
+def discover_subjects(data_path: Path, require_both_sessions: bool = True) -> list[int]:
+    """Scan data/raw for subject IDs; optionally require both S1 and S2 files.
+
+    Looks for filenames like S_1002_S1_*.csv and S_1002_S2_*.csv.
+    """
+    session_map: dict[int, set[int]] = {}
+    for fp in glob.glob(str(data_path / "*.csv")):
+        m = re.search(r"S_(\d+)_S([12])_", Path(fp).name)
+        if not m:
+            continue
+        sid = int(m.group(1))
+        sess = int(m.group(2))
+        session_map.setdefault(sid, set()).add(sess)
+    if require_both_sessions:
+        ids = [sid for sid, sess in session_map.items() if {1, 2}.issubset(sess)]
+    else:
+        ids = list(session_map.keys())
+    return sorted(ids)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Real vs Synthetic Drift Comparison")
+    p.add_argument("--max-subjects", type=int, default=None, help="Limit number of subjects")
+    p.add_argument("--all-subjects", action="store_true", help="Use all available subjects")
+    p.add_argument("--subjects", type=str, default=None, help="Comma-separated subject IDs to use")
+    p.add_argument("--seed", type=int, default=42, help="Random seed")
+    return p.parse_args()
+
+
+args = parse_args()
+np.random.seed(args.seed)
+
+if args.subjects:
+    subjects = [int(s.strip()) for s in args.subjects.split(",") if s.strip()]
+else:
+    all_ids = discover_subjects(DATA_PATH, require_both_sessions=True)
+    if args.all_subjects or (args.max_subjects is None):
+        subjects = all_ids
+    else:
+        k = max(1, min(args.max_subjects, len(all_ids)))
+        subjects = all_ids[:k]
+
+print(f"Using {len(subjects)} subject(s): {subjects[:10]}{'...' if len(subjects)>10 else ''}")
 
 
 # =============================================================================
@@ -422,6 +469,7 @@ drift_types = [
     "REAL",
     # Show magmatch first among synthetic variants for emphasis in plots
     "calibrated_magmatch",
+    "calibrated_magmatch_per_user",
     "calibrated",
     "calibrated_tuned",
     "calibrated_seq_friendly",

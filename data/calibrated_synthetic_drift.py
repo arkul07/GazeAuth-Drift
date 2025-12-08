@@ -320,6 +320,102 @@ class CalibratedSyntheticDrift:
         )
         return X_synthetic, y_s1.copy()
 
+    def generate_synthetic_session2_magmatch_per_user(
+        self,
+        X_s1: np.ndarray,
+        y_s1: np.ndarray,
+        calibration_scale: float = 1.0,
+        temporal_decay: Optional[str] = None,
+        period_index: int = 1,
+        total_periods: int = 1,
+        correlated_noise: bool = True,
+        noise_scale_factor: float = 1.0,
+        mean_shift_only: bool = False,
+        per_user_constant_noise: bool = False,
+        s1_s2_delta_cov: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Per-user magnitude matching: scale synthetic drift per subject so
+        mean|X_syn - X_s1| approximates the subject's real mean drift magnitude.
+
+        This preserves directionality (user_mean_shifts) and structure while
+        adjusting strength per user. Intended to reduce global over/under-scaling.
+        """
+        if self.profile is None:
+            raise ValueError("No drift profile set. Call set_profile() first.")
+
+        X_syn = X_s1.copy()
+        n_features = X_s1.shape[1]
+
+        # Base components from calibrated generator
+        mean_shift_global = self.profile.mean_shift[:n_features] * calibration_scale
+        std_ratio = 1.0 + (self.profile.std_ratio[:n_features] - 1.0) * calibration_scale
+        std_ratio = np.nan_to_num(std_ratio, nan=1.0, posinf=1.0, neginf=1.0)
+        std_ratio = np.clip(std_ratio, 0.1, 10.0)
+
+        # Temporal weighting
+        if temporal_decay:
+            t = max(1, period_index)
+            T = max(1, total_periods)
+            if temporal_decay == "early_strong_poly":
+                alpha = min(1.0, 0.5 + 0.3 * (t / T) + 0.2 * (t / T) ** 2)
+            elif temporal_decay == "linear":
+                alpha = min(1.0, t / T)
+            else:
+                alpha = 1.0
+        else:
+            alpha = 1.0
+
+        # Prepare covariance for correlated noise
+        cov = None
+        if correlated_noise and s1_s2_delta_cov is not None:
+            cov = _make_psd(s1_s2_delta_cov[:n_features, :n_features])
+
+        # Loop per user and apply subject-specific strength
+        users = np.unique(y_s1)
+        for user in users:
+            mask = (y_s1 == user)
+            # Target magnitude from real per-user mean shift
+            user_shift_vec = self.profile.user_mean_shifts.get(int(user), mean_shift_global[:n_features])
+            user_shift_vec = user_shift_vec[:n_features] * calibration_scale
+            # Target magnitude equals the per-user mean shift magnitude
+            target_mag = float(np.mean(np.abs(user_shift_vec)))
+            # Base magnitude for unit strength
+            base_mag = float(np.mean(np.abs(user_shift_vec))) + 1e-8
+            user_strength = (target_mag / base_mag)
+            # Remove randomness; allow a wider range to avoid under-scaling
+            user_strength = float(np.clip(user_strength, 0.5, 2.0))
+
+            # Mean shift
+            X_syn[mask] += user_shift_vec * (user_strength * alpha)
+
+            if not mean_shift_only:
+                user_mean = np.nanmean(X_syn[mask], axis=0)
+                centered = X_syn[mask] - user_mean
+                scaled = centered * (std_ratio ** (user_strength * alpha))
+                X_syn[mask] = user_mean + scaled
+
+            # Add noise (subject-specific constant or sample-wise)
+            # Reduce noise to prioritize magnitude matching over stochastic variation
+            noise_scale = self.profile.overall_magnitude * 0.05 * (user_strength * alpha) * noise_scale_factor
+            if cov is not None:
+                if per_user_constant_noise:
+                    noise_vec = self.rng.multivariate_normal(np.zeros(n_features), cov)
+                    X_syn[mask] += noise_vec * noise_scale
+                else:
+                    correlated = self.rng.multivariate_normal(
+                        np.zeros(n_features), cov, size=np.sum(mask), check_valid='ignore', method='eigh'
+                    )
+                    X_syn[mask] += correlated * noise_scale
+            else:
+                if per_user_constant_noise:
+                    noise_vec = self.rng.normal(0, 1.0, size=n_features)
+                    X_syn[mask] += noise_vec * noise_scale
+                else:
+                    X_syn[mask] += self.rng.normal(0, noise_scale, size=X_syn[mask].shape)
+
+        return X_syn, y_s1.copy()
+
 
 def create_drift_variants(
     X: np.ndarray,
@@ -381,6 +477,19 @@ def create_drift_variants(
     # Mean shift only (no variance change)
     X_mean_only = X + profile.mean_shift[:X.shape[1]]
     variants['mean_shift_only'] = (X_mean_only, y.copy())
+
+    # Per-user magnitude-matched calibrated variant (closer alignment)
+    X_magmatch_user, y_magmatch_user = generator.generate_synthetic_session2_magmatch_per_user(
+        X, y,
+        calibration_scale=1.0,
+        temporal_decay="early_strong_poly",
+        period_index=1,
+        total_periods=2,
+        correlated_noise=True,
+        s1_s2_delta_cov=cov_to_use,
+        per_user_constant_noise=True,
+    )
+    variants['calibrated_magmatch_per_user'] = (X_magmatch_user, y_magmatch_user)
     
     return variants
 
