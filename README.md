@@ -10,11 +10,19 @@ This project implements a **drift-aware continuous authentication system** for A
 ## Quick Start - Verify Results
 
 ### Prerequisites
-```bash
-# Activate virtual environment
-source .venv/bin/activate  # or your venv path
 
-# Install dependencies (if not already done)
+**1. Download GazeBaseVR Dataset** (see Dataset section below)
+   - Download 48 CSV files for 8 subjects from Figshare
+   - Place in `data/raw/` directory
+
+**2. Set up Python environment:**
+```bash
+# Create virtual environment
+python3 -m venv .venv
+source .venv/bin/activate  # on macOS/Linux
+# or .venv\Scripts\activate on Windows
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
@@ -48,10 +56,24 @@ All plots are saved to the `images/` folder.
 
 ## Dataset: GazeBaseVR
 
-File format: `S_1002_S1_5_RAN.csv`
+### Download Instructions
+The GazeBaseVR dataset must be downloaded separately:
+
+1. Visit: https://figshare.com/articles/dataset/GazeBaseVR/19829178
+2. Download the CSV files for the following subjects:
+   - S_1002, S_1003, S_1004, S_1005, S_1007, S_1008, S_1010, S_1011
+3. Place the CSV files in: `data/raw/`
+
+**File format**: `S_1002_S1_5_RAN.csv`
 - `1002` = Subject ID
 - `S1` = Session 1, `S2` = Session 2 (2-3 weeks later)
 - `5_RAN` = Task type (RAN=Random, TEX=Text, PUR=Pursuit)
+
+**Required Files per Subject:** 
+- Session 1: `*_S1_2_PUR.csv`, `*_S1_4_TEX.csv`, `*_S1_5_RAN.csv`
+- Session 2: `*_S2_2_PUR.csv`, `*_S2_4_TEX.csv`, `*_S2_5_RAN.csv`
+
+**Total**: 48 CSV files (6 files × 8 subjects)
 
 **8 Subjects Used:** S_1002, S_1003, S_1004, S_1005, S_1007, S_1008, S_1010, S_1011
 
