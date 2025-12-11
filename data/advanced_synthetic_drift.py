@@ -17,6 +17,7 @@ import numpy as np
 from scipy import stats
 from typing import Tuple, Dict, Optional
 from dataclasses import dataclass
+from .calibrated_synthetic_drift import DriftAnalyzer, CalibratedSyntheticDrift
 
 
 @dataclass
@@ -277,6 +278,26 @@ def create_advanced_drift_variants(X_s1: np.ndarray, y_s1: np.ndarray,
     generator = AdvancedSyntheticDrift(profile)
     
     variants = {}
+
+    # Tuned calibrated variant leveraging real drift profile
+    cal_analyzer = DriftAnalyzer()
+    cal_profile = cal_analyzer.analyze(X_s1, y_s1, X_s2, y_s2)
+    cal_generator = CalibratedSyntheticDrift(cal_profile)
+    # Estimate covariance of S1->S2 deltas to use for correlated noise
+    delta = (X_s2[:min(len(X_s2), len(X_s1))] - X_s1[:min(len(X_s2), len(X_s1))])
+    delta = delta - np.nanmean(delta, axis=0)
+    delta_cov = np.cov(delta.T) if len(delta) > 1 else np.eye(X_s1.shape[1])
+    X_cal_tuned, y_cal_tuned = cal_generator.generate_synthetic_session2(
+        X_s1, y_s1,
+        strength=0.9,
+        calibration_scale=0.7,
+        temporal_decay="early_strong_poly",
+        period_index=2,
+        total_periods=3,
+        correlated_noise=True,
+        s1_s2_delta_cov=delta_cov,
+    )
+    variants['calibrated_tuned'] = (X_cal_tuned, y_cal_tuned)
     
     # Feature-specific drift
     X_fs = generator.feature_specific_drift(X_s1, y_s1, strength=1.0)
