@@ -162,7 +162,7 @@ This project is for research purposes. Please cite appropriately if used in acad
 ```bibtex
 @article{gaze_auth_2024,
   title={Gaze-Only Continuous Authentication for AR/VR with Temporal Drift Handling},
-  author={Research Team},
+  author={Arya Kulkarni and Sathya Kumaraguru},
   journal={Biometric Security with AI},
   year={2024}
 }
